@@ -219,6 +219,7 @@ class DEVICE():
                 # is a the touch device we are interested in.
                 if key == 'Kernel':
                     dev = value
+                    is_dev = False
                 elif key == 'Size' and dev:
                     is_dev = True
                 elif key == 'Capabilities' and value == attribute and is_dev:
