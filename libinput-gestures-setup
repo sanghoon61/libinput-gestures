@@ -93,9 +93,7 @@ user_action() {
 	    echo "$NAME started."
 	fi
     elif [ $cmd = "stop" ]; then
-	# May have an instance of libinput-debug-events running for each
-	# of touchpad and touchscreen.
-	for prog in libinput-debug-events libinput-debug-events $NAME; do
+	for prog in libinput-debug-events $NAME; do
 	    if pkill -u $USER -f "$prog\$|$prog " &>/dev/null; then
 		echo "$prog stopped."
 	    fi
