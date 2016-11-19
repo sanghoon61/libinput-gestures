@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 'Read gestures from libinput touchpad and action shell commands.'
 # Mark Blakeney, Sep 2015
-import os, sys, argparse, subprocess, shlex, re, getpass, fcntl
+import os, sys, argparse, subprocess, shlex, re, getpass, fcntl, threading
 from pathlib import Path
 
 PROG = Path(sys.argv[0]).name
@@ -102,41 +102,19 @@ def internal(args):
     if index >= minindex and index < maxindex:
         run(['wmctrl', '-s', str(index)])
 
-def get_device():
-    'Determine libinput touchpad device path'
-    res = run('libinput-list-devices')
-    if res.returncode == 0:
-        dev = None
-        for line in res.stdout.splitlines():
-            line = line.strip()
-            if not line or ':' not in line:
-                continue
-
-            key, value = line.split(':', maxsplit=1)
-            key = key.strip()
-            value = value.strip()
-
-            # Assume that any device that has any Tap-to-click value is a
-            # touchpad.
-            if key == 'Kernel':
-                dev = value
-            elif key == 'Tap-to-click' and value != 'n/a' and dev:
-                return dev
-
-    sys.exit('Could not determine touchpad device.')
-
 class GESTURE:
     'Abstract base class for handling for gestures'
-    def __init__(self):
+    def __init__(self, devname):
         'Initialise this gesture at program start'
         self.name = type(self).__name__
+        self.devname = devname
         self.motions = {}
 
     def add(self, motion, fingers, command):
         'Add a configured motion command for this gesture'
         if motion not in self.SUPPORTED_MOTIONS:
-            return 'Motion "{}" is not supported for {}'.format(motion,
-                    self.name)
+            return 'Motion "{}" is not supported for {} {}'.format(motion,
+                    self.devname, self.name)
 
         key = (motion, fingers) if fingers else motion
         self.motions[key] = shlex.split(command)
@@ -149,8 +127,8 @@ class GESTURE:
                 self.motions.get(motion)
 
         if args.verbose:
-            print('{}: {} {} {} {}'.format(PROG, self.name, motion,
-                self.fingers, self.data))
+            print('{}: {} {} {} {} {}'.format(PROG, self.devname, self.name,
+                motion, self.fingers, self.data))
             if command:
                 print('  ', ' '.join(command))
 
@@ -203,9 +181,101 @@ class PINCH(GESTURE):
         if self.data != 0.0:
             self.action('in' if self.data >= 0.0 else 'out')
 
-# Create gesture handler instances and insert them in handler lookup
-# table based on their name.
-handlers = {h.name: h for h in (SWIPE(), PINCH())}
+class DEVICE():
+    'Class to manage touch pads or screens'
+    devices = {}
+
+    def __init__(self, name, dev):
+        'Constructor'
+        self.name = name
+        self.dev = dev
+
+        # Create gesture handler instances and insert them in handler lookup
+        # table based on their name.
+        self.handlers = {h.name: h for h in (SWIPE(name), PINCH(name))}
+        DEVICE.devices[name] = self
+
+    @staticmethod
+    def get(name, attribute):
+        'Determine libinput touch device path'
+        if name in DEVICE.devices:
+            return DEVICE.devices[name]
+
+        res = run('libinput-list-devices')
+        if res.returncode == 0:
+            dev = None
+            is_dev = False
+            for line in res.stdout.splitlines():
+                line = line.strip()
+                if not line or ':' not in line:
+                    continue
+
+                key, value = line.split(':', maxsplit=1)
+                key = key.strip()
+                value = value.strip()
+
+                # Assume that any device that has supplied attribute value
+                # is a the touch device we are interested in.
+                if key == 'Kernel':
+                    dev = value
+                elif key == 'Size' and dev:
+                    is_dev = True
+                elif key == 'Capabilities' and value == attribute and is_dev:
+                    DEVICE.devices[name] = DEVICE(name, dev)
+                    return DEVICE.devices[name]
+
+        sys.exit('Could not determine {} device.'.format(name))
+
+    def run(self, args):
+        # Note your must "sudo gpasswd -a $USER input" then log out/in for
+        # permission to access the device.
+        command = 'stdbuf -oL -- libinput-debug-events --device {}'.format(
+                self.dev)
+
+        cmd = subprocess.Popen(shlex.split(command), stdout=subprocess.PIPE,
+                bufsize=0, universal_newlines=True)
+
+        # Sit in a loop forever reading the libinput debug output for
+        # GESTURES ..
+        handler = None
+        for line in cmd.stdout:
+
+            # Just output raw messages if in that debug mode
+            if args.raw:
+                print(line.strip())
+                continue
+
+            # Only interested in gestures
+            if 'GESTURE_' not in line:
+                continue
+
+            # Split debug line into relevant fields
+            dev, gevent, time, other = line.strip().split(maxsplit=3)
+            gesture, event = gevent[8:].split('_')
+            if ' ' in other:
+                fingers, params = other.split(maxsplit=1)
+            else:
+                fingers, params = other, None
+
+            # Action each type of event
+            if event == 'UPDATE':
+                if handler:
+                    handler.update(re.split(r'[ (/@]+', params))
+            elif event == 'BEGIN':
+                handler = self.handlers.get(gesture)
+                if handler:
+                    handler.begin(fingers)
+                else:
+                    print('Unknown {} gesture received: {}.'.format(
+                        self.name, gesture), file=sys.stderr)
+            elif event == 'END':
+                # Ignore gesture if final action is cancelled
+                if params != 'cancelled' and handler:
+                    handler.end()
+                handler = None
+            else:
+                print('Unknown {} gesture + event received: {} + {}.'.format(
+                    self.name, gesture, event), file=sys.stderr)
 
 def get_conf_line(line):
     'Process a single line in conf file'
@@ -217,12 +287,16 @@ def get_conf_line(line):
 
     key, gesture, motion, command = fields
 
-    if key != 'gesture:':
+    if key == 'gesture:':
+        dev = DEVICE.get('touchpad', 'pointer')
+    elif key == 'gesture_screen':
+        dev = DEVICE.get('touchscreen', 'touch')
+    else:
         return 'Configuration command "{}" is not supported'.format(key)
 
-    handler = handlers.get(gesture.upper())
+    handler = dev.handlers.get(gesture.upper())
     if not handler:
-        return 'Gesture "{}" is not supported'.format(gesture)
+        return 'Gesture "{}" is not supported for {}'.format(gesture, dev.name)
 
     # Gesture command can be configured with optional specific finger
     # count so look for that
@@ -263,71 +337,29 @@ proglock = open_lock(PROG, user)
 if not proglock:
     sys.exit('{} is already running for {}, terminating ..'.format(PROG, user))
 
-# Get touchpad device
-device = get_device()
-
 # Read gestures from conf file. Use file given as command line argument,
 # else look in user dir then system dir.
-if not args.raw:
-    if args.conffile:
-        if not get_conf(Path(args.conffile)):
-            sys.exit('Conf file "{}" does not exist.'.format(args.conffile))
+if args.conffile:
+    if not get_conf(Path(args.conffile)):
+        sys.exit('Conf file "{}" does not exist.'.format(args.conffile))
+else:
+    for confdir in CONFDIRS:
+        if get_conf(Path(confdir, CONFNAME)):
+            break
     else:
-        for confdir in CONFDIRS:
-            if get_conf(Path(confdir, CONFNAME)):
-                break
-        else:
-            sys.exit('No file {} in {}.'.format(CONFNAME,
-                ' or '.join(CONFDIRS)))
+        sys.exit('No file {} in {}.'.format(CONFNAME, ' or '.join(CONFDIRS)))
 
+# Create a thread to process events for each device ..
+for dev in DEVICE.devices.values():
     if args.verbose:
-        print('{}: monitoring device {} for {} gestures'.format(PROG, device,
-            sum([len(h.motions) for h in handlers.values()])))
+        print('{}: monitoring {} device {} for {} gestures'.format(PROG,
+            dev.name, dev.dev,
+            sum([len(h.motions) for h in dev.handlers.values()])))
+    t = threading.Thread(target=dev.run, args=(args,))
+    t.daemon = True
+    dev.thread = t
+    t.start()
 
-# Note your must "sudo gpasswd -a $USER input" then log out/in for
-# permission to access the device.
-command = 'stdbuf -oL -- libinput-debug-events --device {}'.format(device)
-
-cmd = subprocess.Popen(shlex.split(command), stdout=subprocess.PIPE,
-        bufsize=0, universal_newlines=True)
-
-# Sit in a loop forever reading the libinput debug output for GESTURES ..
-handler = None
-for line in cmd.stdout:
-
-    # Just output raw messages if in that debug mode
-    if args.raw:
-        print(line.strip())
-        continue
-
-    # Only interested in gestures
-    if 'GESTURE_' not in line:
-        continue
-
-    # Split debug line into relevant fields
-    dev, gevent, time, other = line.strip().split(maxsplit=3)
-    gesture, event = gevent[8:].split('_')
-    if ' ' in other:
-        fingers, params = other.split(maxsplit=1)
-    else:
-        fingers, params = other, None
-
-    # Action each type of event
-    if event == 'UPDATE':
-        if handler:
-            handler.update(re.split(r'[ (/@]+', params))
-    elif event == 'BEGIN':
-        handler = handlers.get(gesture)
-        if handler:
-            handler.begin(fingers)
-        else:
-            print('Unknown gesture received: {}.'.format(gesture),
-                    file=sys.stderr)
-    elif event == 'END':
-        # Ignore gesture if final action is cancelled
-        if params != 'cancelled' and handler:
-            handler.end()
-        handler = None
-    else:
-        print('Unknown gesture + event received: {} + {}.'.format(gesture,
-            event), file=sys.stderr)
+# Now just sit and let child threads do the work ..
+for dev in DEVICE.devices.values():
+    dev.thread.join()
