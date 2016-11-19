@@ -127,10 +127,10 @@ class GESTURE:
                 self.motions.get(motion)
 
         if args.verbose:
-            print('{}: {} {} {} {} {}'.format(PROG, self.devname, self.name,
-                motion, self.fingers, self.data))
-            if command:
-                print('  ', ' '.join(command))
+            with DEVICE.print_lock:
+                print('{}: {} {} {} {} {}{}'.format(PROG, self.devname,
+                    self.name, motion, self.fingers, self.data,
+                    ('\n  ' + ' '.join(command)) if command else ''))
 
         if command and not args.debug:
             if command[0] == '_internal':
@@ -184,6 +184,7 @@ class PINCH(GESTURE):
 class DEVICE():
     'Class to manage touch pads or screens'
     devices = {}
+    print_lock = threading.Lock()
 
     def __init__(self, name, dev):
         'Constructor'
@@ -242,7 +243,8 @@ class DEVICE():
 
             # Just output raw messages if in that debug mode
             if args.raw:
-                print(line.strip())
+                with DEVICE.print_lock:
+                    print(line.strip())
                 continue
 
             # Only interested in gestures
@@ -289,7 +291,7 @@ def get_conf_line(line):
 
     if key == 'gesture:':
         dev = DEVICE.get('touchpad', 'pointer')
-    elif key == 'gesture_screen':
+    elif key == 'gesture_screen:':
         dev = DEVICE.get('touchscreen', 'touch')
     else:
         return 'Configuration command "{}" is not supported'.format(key)
@@ -352,9 +354,10 @@ else:
 # Create a thread to process events for each device ..
 for dev in DEVICE.devices.values():
     if args.verbose:
-        print('{}: monitoring {} device {} for {} gestures'.format(PROG,
-            dev.name, dev.dev,
-            sum([len(h.motions) for h in dev.handlers.values()])))
+        with DEVICE.print_lock:
+            print('{}: monitoring {} device {} for {} gestures'.format(PROG,
+                dev.name, dev.dev,
+                sum([len(h.motions) for h in dev.handlers.values()])))
     t = threading.Thread(target=dev.run, args=(args,))
     t.daemon = True
     dev.thread = t
