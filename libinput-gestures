@@ -3,6 +3,7 @@
 # Mark Blakeney, Sep 2015
 import os, sys, argparse, subprocess, shlex, re, getpass, fcntl, platform, math
 from pathlib import Path
+from time import time as Time
 
 PROG = Path(sys.argv[0]).name
 
@@ -18,6 +19,7 @@ OBLIQUE_RATIO = math.tan(math.radians(22.5))
 
 # Minimum significant distance to move for swipes, in dots squared.
 ABZSQUARE = 70**2
+ABZSQUARE_STOP = 5
 
 # Rotation threshold in degrees to discriminate pinch rotate from in/out
 ROTATE_ANGLE = 15.0
@@ -231,6 +233,7 @@ class GESTURE:
         'Initialise this gesture at the start of motion'
         self.fingers = fingers
         self.data = [0.0, 0.0]
+        self.is_first = True
 
     def action(self, motion):
         'Action a motion command for this gesture'
@@ -254,19 +257,29 @@ class SWIPE(GESTURE):
     extended_text = '_'
 
     def update(self, coords):
-        'Update this gesture for a motion'
-        self.data[0] += float(coords[2])
-        self.data[1] += float(coords[3])
+        if self.is_first:
+            'Update this gesture for a motion'
+            self.data[0] += float(coords[2])
+            self.data[1] += float(coords[3])
+
+            if self.data[0]**2 + self.data[1]**2 > ABZSQUARE:
+                self.run_cmd()
+                self.time = Time()
+                self.is_first = False
+        #elif Time() > self.time + 0.2:
+        elif float(coords[2])**2 + float(coords[3])**2 < ABZSQUARE_STOP:
+            #print(float(coords[2])**2 + float(coords[3])**2)
+            self.data = [0.0, 0.0]
+            self.is_first = True
 
     def end(self):
+        pass
+
+    def run_cmd(self):
         'Action this gesture at the end of a motion sequence'
         x, y = self.data
         abx = abs(x)
         aby = abs(y)
-
-        # Require absolute distance movement beyond a small thresh-hold.
-        if abx**2 + aby**2 < ABZSQUARE:
-            return
 
         # Discriminate left/right or up/down.
         # If significant movement in both planes the consider it a
